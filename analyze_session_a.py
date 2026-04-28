@@ -1,4 +1,23 @@
 #!/usr/bin/env python3
+"""
+用途：
+1. 对 1 个或 2 个 WAV 录音做“特殊瞬态事件”检测。
+2. 这里的“特殊事件”指人耳能明确数出来的拍手、敲击、撞击这类短促事件。
+3. 当传感器距离声源远、事件很弱时，会先在强侧学出“本次事件长什么样”，再去弱侧复核。
+
+主流程：
+1. `main()` 解析参数，逐个 WAV 调用 `analyze_file()`
+2. `analyze_file()` 内部先调 `collect_candidates()` 找候选事件
+3. 所有文件的候选合并后，`build_template()` 生成“本次会话的事件模板”
+4. 每个文件再调 `classify_candidates()`，把候选分成“直接确认”与“淘汰”
+5. 如果有两个文件，再调 `recover_missing_events()`，只在本地找到弱证据时补成“复核确认”
+6. 最后 `print_result()` 输出中文结果，可选写入 JSON
+
+设计原则：
+1. 不写死事件个数
+2. 不因为另一端有事件，就强行给本端“补假数”
+3. 本端必须出现自己的波形证据，才允许计入最终事件数
+"""
 
 import argparse
 import json
@@ -12,6 +31,7 @@ from wav_signal import load_signal
 
 @dataclass
 class CandidateEvent:
+    # 候选事件：只是“可能是一次拍手/敲击”，还没有进入最终结果。
     block_index: int
     onset_s: float
     peak_s: float
@@ -26,6 +46,7 @@ class CandidateEvent:
 
 @dataclass
 class ReportEvent:
+    # 输出事件：已经通过模板确认，或者通过双文件复核后确认。
     onset_s: float
     peak_s: float
     score: float
@@ -38,6 +59,7 @@ class ReportEvent:
 
 @dataclass
 class EventTemplate:
+    # 事件模板：不是固定声音文件，而是“本次录音里这一类事件的共同形状”。
     vector: np.ndarray
     confirm_similarity: float
     recover_similarity: float
@@ -50,6 +72,7 @@ class EventTemplate:
 
 @dataclass
 class AnalysisResult:
+    # 单个 WAV 文件的完整分析结果。
     wav_path: Path
     sample_rate: int
     signal: np.ndarray
@@ -64,6 +87,9 @@ class AnalysisResult:
 
 
 def moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    # 简单滑动平均。用于把粗糙包络平滑一点，压低微小抖动。
+    # window 越大：越平滑，但会损失时间分辨率。
+    # window 越小：越灵敏，但更容易把噪声凸显出来。
     if window <= 1:
         return values.astype(np.float64, copy=True)
     kernel = np.ones(window, dtype=np.float64) / window
@@ -71,6 +97,9 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
 
 
 def block_max(signal: np.ndarray, block_size: int) -> np.ndarray:
+    # 按 block_size 分块，每块取最大绝对幅值，得到“粗包络”。
+    # block_size 越大：抗噪声更强，但多个靠得很近的小峰可能被揉在一起。
+    # block_size 越小：时间定位更细，但更容易把回响/噪声也当成独立峰。
     pad = (-len(signal)) % block_size
     if pad:
         signal = np.pad(signal, (0, pad), mode="constant")
@@ -78,6 +107,17 @@ def block_max(signal: np.ndarray, block_size: int) -> np.ndarray:
 
 
 def build_feature(signal: np.ndarray, sample_rate: int, block_ms: float) -> tuple[np.ndarray, np.ndarray, int]:
+    # 构建本脚本最核心的特征：
+    # 1. envelope：分块后的粗包络
+    # 2. feature：强调“突然变大”的新事件得分
+    #
+    # 这里的 feature 不是直接看振幅，而是看：
+    # - 短窗口平均是否明显高于长窗口平均（novelty）
+    # - 上升沿是否足够陡（rise）
+    #
+    # block_ms 是最关键参数之一：
+    # - 调大：更适合“按人耳数拍手”，不容易把一次拍手后的反射拆成多次
+    # - 调小：更容易把弱小事件拉出来，但也更容易多检
     block_size = max(1, int(round(sample_rate * block_ms / 1000.0)))
     envelope = block_max(signal.astype(np.float64), block_size)
     short_window = max(1, int(round(10.0 / block_ms)))
@@ -92,6 +132,8 @@ def build_feature(signal: np.ndarray, sample_rate: int, block_ms: float) -> tupl
 
 
 def extract_window(values: np.ndarray, center_index: int, left: int, right: int) -> np.ndarray:
+    # 以 center_index 为中心取一个局部窗口。
+    # 这个函数主要被 `build_candidate()` 调用，用来截取候选事件附近的局部形状。
     start = center_index - left
     stop = center_index + right + 1
     pad_left = max(0, -start)
@@ -103,6 +145,9 @@ def extract_window(values: np.ndarray, center_index: int, left: int, right: int)
 
 
 def find_onset(signal: np.ndarray, peak_index: int, search_radius: int) -> int:
+    # 已知峰值点后，向前找“真正开始抬头”的起始点。
+    # search_radius 越大：更有机会找到真实起点，但也可能被更早的干扰拖走。
+    # search_radius 越小：定位更保守，可能把起点报晚。
     start = max(0, peak_index - search_radius)
     local = signal[start : peak_index + 1].astype(np.float64)
     if local.size <= 1:
@@ -117,6 +162,8 @@ def find_onset(signal: np.ndarray, peak_index: int, search_radius: int) -> int:
 
 
 def candidate_width_ms(feature: np.ndarray, index: int, block_ms: float) -> float:
+    # 估算一个候选峰有多“宽”。
+    # 很宽但不尖的波形，更像背景起伏/拖尾，不像一次明确拍手。
     peak = float(feature[index])
     threshold = peak * 0.25
     left = index
@@ -129,12 +176,16 @@ def candidate_width_ms(feature: np.ndarray, index: int, block_ms: float) -> floa
 
 
 def candidate_local_energy(feature: np.ndarray, index: int) -> float:
+    # 看候选峰附近一小段区域的总能量。
+    # 它比单点峰值更稳，常用来区分“真实小事件”和“单点毛刺”。
     start = max(0, index - 2)
     stop = min(len(feature), index + 3)
     return float(np.sum(feature[start:stop]))
 
 
 def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    # 模板相似度。1.0 表示形状非常像，越低表示越不像。
+    # 这里只比较“形状”，不是比较绝对音量，所以远端弱信号也有机会匹配到。
     denom = float(np.linalg.norm(left) * np.linalg.norm(right))
     if denom <= 0.0:
         return 0.0
@@ -142,6 +193,13 @@ def cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
 
 
 def candidate_is_plausible(candidate: CandidateEvent, *, duration_s: float, edge_margin_s: float) -> bool:
+    # 候选级过滤：
+    # 这里只做“明显不靠谱”的剔除，尽量不要在这里误杀真实事件。
+    #
+    # 过滤内容：
+    # 1. 录音刚开始/刚结束的截断伪峰
+    # 2. 很宽又很弱的慢变化
+    # 3. 极弱的底噪尖刺
     if candidate.onset_s < edge_margin_s:
         return False
     if duration_s - candidate.peak_s < edge_margin_s:
@@ -162,6 +220,14 @@ def build_candidate(
     block_ms: float,
     block_index: int,
 ) -> CandidateEvent:
+    # 把一个 block 索引展开成“候选事件对象”。
+    # 调用链：
+    # `collect_candidates()` -> `build_candidate()`
+    #
+    # 这里会补出候选的完整信息：
+    # 1. onset_s / peak_s：事件起点和峰值时刻
+    # 2. width_ms / local_energy：形状与强度
+    # 3. shape_vector：后面给模板匹配用的局部形状向量
     block_size = max(1, int(round(sample_rate * block_ms / 1000.0)))
     peak_center = block_index * block_size
     peak_start = max(0, peak_center - block_size)
@@ -203,6 +269,22 @@ def collect_candidate_indices(
     block_ms: float,
     max_candidates: int,
 ) -> list[int]:
+    # 从 feature 里先找出“可能有事”的块索引。
+    # 调用链：
+    # `collect_candidates()` -> `collect_candidate_indices()`
+    #
+    # 参数影响：
+    # 1. min_score_ratio
+    #    - 调大：只保留更强的候选，漏检风险上升，误检下降
+    #    - 调小：弱事件更容易进来，但噪声/回响也更容易进来
+    # 2. percentile_threshold
+    #    - 调大：阈值更严格，候选更少
+    #    - 调小：候选更多，更依赖后续模板筛选
+    # 3. candidate_gap_ms
+    #    - 调大：近邻峰更早被合并，不容易把一次拍手拆成多次
+    #    - 调小：容易多检，特别是在空气传播和有回响时
+    # 4. max_candidates
+    #    - 只是候选上限，不是最终事件数上限
     threshold = max(
         float(np.percentile(feature, percentile_threshold)),
         float(np.max(feature)) * min_score_ratio,
@@ -233,6 +315,12 @@ def collect_candidate_indices(
 
 
 def merge_close_candidates(candidates: list[CandidateEvent], merge_gap_s: float) -> list[CandidateEvent]:
+    # 把时间上过近的两个候选合并成一个。
+    # 调用位置有两处：
+    # 1. `collect_candidates()`：候选阶段的近邻合并
+    # 2. `classify_candidates()`：最终确认前再做一次合并
+    #
+    # merge_gap_s 越大：越不容易多检，但过大时会把两次真实快速拍手并成一次。
     merged: list[CandidateEvent] = []
     for candidate in sorted(candidates, key=lambda item: item.onset_s):
         if not merged:
@@ -258,6 +346,12 @@ def collect_candidates(
     edge_margin_ms: float,
     max_candidates: int,
 ) -> tuple[np.ndarray, np.ndarray, list[CandidateEvent]]:
+    # 单文件候选提取总入口。
+    # 调用链：
+    # `analyze_file()` -> `collect_candidates()`
+    # `collect_candidates()` -> `build_feature()` -> `collect_candidate_indices()` -> `build_candidate()`
+    #
+    # 这一步只负责“找可能的事件”，不负责做最终确认。
     envelope, feature, _ = build_feature(signal, sample_rate, block_ms)
     indices = collect_candidate_indices(
         feature,
@@ -288,6 +382,23 @@ def collect_candidates(
 
 
 def build_template(results: list[AnalysisResult]) -> EventTemplate:
+    # 从本次会话的所有候选里学出“这次特殊事件的典型形状”。
+    # 调用链：
+    # `main()` -> `build_template()`
+    #
+    # 重要说明：
+    # 1. 不是加载固定模板文件
+    # 2. 不是只识别一种永远不变的声音
+    # 3. 而是对“这一次录音里反复出现的同类事件”做自适应建模
+    #
+    # 例如：
+    # - 这一轮你拍手，它就学拍手
+    # - 下一轮你敲桌子，它就学敲桌子
+    #
+    # 这里还会自动导出几个阈值：
+    # - confirm_similarity：直接确认阈值
+    # - recover_similarity：双文件复核时使用的较低阈值
+    # - min_confirm_energy / min_recover_energy：对应的能量门槛
     pool = [candidate for result in results for candidate in result.candidates]
     if not pool:
         zero = np.zeros(26, dtype=np.float64)
@@ -373,6 +484,10 @@ def build_template(results: list[AnalysisResult]) -> EventTemplate:
 
 
 def confidence_label(similarity: float, template: EventTemplate) -> str:
+    # 这里只是给人看结果时的“相对置信等级”。
+    # 注意：
+    # - `低` 不代表一定是假
+    # - 只是说它离直接确认阈值比较近，证据没那么强
     if similarity >= template.confirm_similarity + 0.12:
         return "高"
     if similarity >= template.confirm_similarity + 0.05:
@@ -386,6 +501,10 @@ def report_from_candidate(
     template: EventTemplate,
     confirmation: str,
 ) -> ReportEvent:
+    # 把内部候选对象转换成最终输出对象。
+    # confirmation 用来区分：
+    # - 直接确认：本文件自己证据就足够
+    # - 复核确认：本文件本地证据偏弱，但在双文件节奏对齐后复核通过
     return ReportEvent(
         onset_s=candidate.onset_s,
         peak_s=candidate.peak_s,
@@ -404,6 +523,19 @@ def classify_candidates(
     *,
     min_event_gap_ms: float,
 ) -> None:
+    # 单文件的“直接确认”阶段。
+    # 调用链：
+    # `main()` -> `classify_candidates()`
+    #
+    # 通过条件：
+    # 1. 模板相似度够高
+    # 2. 局部能量达到直接确认门槛
+    # 3. 宽度不能明显偏离模板
+    #
+    # 参数影响：
+    # min_event_gap_ms
+    # - 调大：默认更贴近“人耳数事件”，多检更少
+    # - 调小：适合极快节奏敲击，但空气传播时更容易把回响拆开
     confirmed_candidates: list[CandidateEvent] = []
     width_limit = max(40.0, template.median_width_ms * 2.5)
     merge_gap_s = max(0.20, min_event_gap_ms / 1000.0 * 0.75)
@@ -428,6 +560,8 @@ def classify_candidates(
 
 
 def estimate_offset(reference_events: list[ReportEvent], target_events: list[ReportEvent]) -> float | None:
+    # 估计两个文件之间的大致时间偏移。
+    # 这里只是为了“双文件复核时知道去哪里找”，不是做距离估计。
     if not reference_events or not target_events:
         return None
 
@@ -448,6 +582,8 @@ def match_events_by_offset(
     offset_s: float,
     tolerance_s: float,
 ) -> tuple[set[int], set[int]]:
+    # 基于估计出的 offset，把两边已确认事件先做一轮粗配对。
+    # 哪些 reference 事件没有配上 target，后面就会进入“弱侧补找/复核”流程。
     matched_reference: set[int] = set()
     matched_target: set[int] = set()
     target_used = [False] * len(target_events)
@@ -482,6 +618,13 @@ def search_candidate_near_time(
     radius_ms: float,
     edge_margin_ms: float,
 ) -> CandidateEvent | None:
+    # 已知另一边某个事件的大致时刻后，在本文件附近小范围搜索一个最像模板的弱候选。
+    # 调用链：
+    # `recover_missing_events()` -> `search_candidate_near_time()`
+    #
+    # radius_ms 越大：
+    # - 更不怕起录时差和粗略对齐误差
+    # - 但也更容易搜到无关噪声
     center_index = int(round(center_time_s / result.block_ms * 1000.0))
     radius_blocks = max(1, int(round(radius_ms / result.block_ms)))
     start = max(1, center_index - radius_blocks)
@@ -530,6 +673,15 @@ def recover_missing_events(
     min_event_gap_ms: float,
     edge_margin_ms: float,
 ) -> None:
+    # 双文件复核阶段。
+    # 调用链：
+    # `main()` -> `recover_missing_events()`
+    #
+    # 核心原则：
+    # 1. 只有 reference 端比 target 端确认事件更多时，才尝试在 target 端补找
+    # 2. 另一端只提供“去哪里找”的线索
+    # 3. target 端必须自己出现本地证据，才允许补成“复核确认”
+    # 4. 如果找不到足够证据，就记到 `suspected_missing_s`，不会硬加到最终结果
     if len(reference.confirmed_events) <= len(target.confirmed_events):
         return
 
@@ -594,6 +746,8 @@ def recover_missing_events(
 
 
 def result_rank_key(result: AnalysisResult) -> tuple[int, float, float]:
+    # 给两个文件排“谁更像强参考端”的简单排序分数。
+    # 一般会让确认数更多、整体相似度更高、能量更强的一边先作为 reference。
     recovered_bonus = result.recovered_events * 0.2
     similarity_sum = float(np.sum([event.template_similarity for event in result.confirmed_events]))
     energy_sum = float(np.sum([event.local_energy for event in result.confirmed_events]))
@@ -608,6 +762,9 @@ def analyze_file(
     edge_margin_ms: float,
     max_candidates: int,
 ) -> AnalysisResult:
+    # 单个 WAV 文件分析入口。
+    # 调用链：
+    # `main()` -> `analyze_file()` -> `collect_candidates()`
     sample_rate, signal = load_signal(wav_path)
     envelope, feature, candidates = collect_candidates(
         signal,
@@ -633,6 +790,7 @@ def analyze_file(
 
 
 def event_to_payload(event: ReportEvent) -> dict[str, object]:
+    # 把输出事件转成 JSON 可写入的普通字典。
     return {
         "onset_s": event.onset_s,
         "peak_s": event.peak_s,
@@ -646,6 +804,7 @@ def event_to_payload(event: ReportEvent) -> dict[str, object]:
 
 
 def result_to_payload(result: AnalysisResult) -> dict[str, object]:
+    # 把单文件分析结果转成 JSON 可写入的普通字典。
     return {
         "wav_path": str(result.wav_path),
         "duration_s": result.duration_s,
@@ -658,6 +817,12 @@ def result_to_payload(result: AnalysisResult) -> dict[str, object]:
 
 
 def print_result(result: AnalysisResult) -> None:
+    # 中文终端输出。
+    # 这是人直接看的版本，重点显示：
+    # 1. 候选事件数
+    # 2. 已确认特殊事件数
+    # 3. 其中有多少是复核补找成功
+    # 4. 还有多少疑似漏检
     print(f"文件：{result.wav_path}")
     print(f"录音时长={result.duration_s:.3f}秒")
     print(f"候选事件数={len(result.candidates)}")
@@ -681,37 +846,59 @@ def print_result(result: AnalysisResult) -> None:
 
 
 def main() -> None:
+    # 总入口。
+    # 推荐阅读顺序：
+    # 1. 先看这里，理解主流程和参数
+    # 2. 再看 `analyze_file()` / `collect_candidates()`
+    # 3. 再看 `build_template()` / `classify_candidates()`
+    # 4. 最后看 `recover_missing_events()`
     parser = argparse.ArgumentParser(description="检测一个或两个 WAV 文件中的人耳可辨特殊事件。")
     parser.add_argument("wav_paths", nargs="+", type=Path, help="一个或两个 WAV 文件路径")
     parser.add_argument(
         "--block-ms",
         type=float,
         default=10.0,
-        help="特征计算的时间块大小，单位毫秒",
+        help=(
+            "特征计算的时间块大小，单位毫秒。"
+            "调大更不容易把一次拍手后的回响拆成多次；"
+            "调小时间定位更细，但更容易多检。"
+        ),
     )
     parser.add_argument(
         "--min-score-ratio",
         type=float,
         default=0.002,
-        help="候选检测时，最弱特征分数相对最强分数的下限比例",
+        help=(
+            "候选检测时，最弱特征分数相对最强分数的下限比例。"
+            "调大更严格、候选更少；调小更容易保住弱事件，但噪声也更容易进来。"
+        ),
     )
     parser.add_argument(
         "--min-event-gap-ms",
         type=float,
         default=300.0,
-        help="两个最终事件之间的最小间隔，单位毫秒",
+        help=(
+            "两个最终事件之间的最小间隔，单位毫秒。"
+            "调大可减少多检；调得过大时，节奏很快的真实连续敲击可能被并成一次。"
+        ),
     )
     parser.add_argument(
         "--edge-margin-ms",
         type=float,
         default=200.0,
-        help="忽略录音开头和结尾附近的边界伪峰，单位毫秒",
+        help=(
+            "忽略录音开头和结尾附近的边界伪峰，单位毫秒。"
+            "调大更安全，但如果真实事件恰好非常靠近录音边缘，也可能被忽略。"
+        ),
     )
     parser.add_argument(
         "--max-candidates",
         type=int,
         default=128,
-        help="每个文件最多保留多少个候选事件",
+        help=(
+            "每个文件最多保留多少个候选事件。"
+            "一般不需要改；只有事件特别多，或你故意把阈值调得很低时才可能碰到。"
+        ),
     )
     parser.add_argument("--output-json", type=Path, help="可选：输出 JSON 文件路径")
     args = parser.parse_args()
