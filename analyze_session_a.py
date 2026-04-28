@@ -19,6 +19,11 @@
 3. 本端必须出现自己的波形证据，才允许计入最终事件数
 """
 
+"""
+  - 主流程怎么走：main() -> analyze_file() -> collect_candidates() -> build_template() -> classify_candidates() -> recover_missing_events()
+  - 函数之间怎么调用、每个函数负责什么
+  - 关键参数调大/调小分别会带来什么后果，尤其是 --block-ms、--min-score-ratio、--min-event-gap-ms、--edge-margin-ms、--max-candidates
+"""
 import argparse
 import json
 from dataclasses import dataclass
@@ -973,3 +978,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
