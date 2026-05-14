@@ -1,0 +1,16 @@
+[Unit]
+Description=PTP4L Slave - IEEE 1588 Precision Time Protocol (Slave/Client)
+Documentation=man:ptp4l(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l-slave.conf -i eth0 -m
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

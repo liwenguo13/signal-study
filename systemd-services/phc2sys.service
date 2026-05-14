@@ -1,0 +1,18 @@
+[Unit]
+Description=PHC2SYS - Synchronize system clock to PTP hardware clock
+Documentation=man:phc2sys(8)
+After=ptp4l-slave.service network-online.target
+Wants=network-online.target
+Requires=ptp4l-slave.service
+BindsTo=ptp4l-slave.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/phc2sys -s eth0 -c CLOCK_REALTIME -w -m
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

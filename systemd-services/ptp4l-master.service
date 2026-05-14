@@ -1,0 +1,16 @@
+[Unit]
+Description=PTP4L Master - IEEE 1588 Precision Time Protocol (Master/Grandmaster)
+Documentation=man:ptp4l(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l-master.conf -i eth0 -m
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
